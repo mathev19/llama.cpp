@@ -56,6 +56,16 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #include <unistd.h>
+
+#ifdef GGML_USE_HIP
+// HIP returns warp masks as 64-bit values because CDNA is wave64. gfx1100 is
+// wave32, so the upper 32 bits are always zero and truncating the result back
+// to uint32_t stays correct. Not safe as-is on CDNA.
+#define MOE_WARP_MASK 0xffffffffffffffffULL
+#else
+#define MOE_WARP_MASK 0xffffffff
+#endif
+
 #endif
 
 namespace {
@@ -2771,9 +2781,9 @@ static __device__ uint32_t moe_grouped_effective_frequency(
 static __device__ void moe_grouped_warp_min(uint32_t & frequency, unsigned long long & age, uint32_t & slot) {
 #pragma unroll
     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        const uint32_t other_frequency = __shfl_xor_sync(0xffffffff, frequency, offset, WARP_SIZE);
-        const unsigned long long other_age = __shfl_xor_sync(0xffffffff, age, offset, WARP_SIZE);
-        const uint32_t other_slot = __shfl_xor_sync(0xffffffff, slot, offset, WARP_SIZE);
+        const uint32_t other_frequency = __shfl_xor_sync(MOE_WARP_MASK, frequency, offset, WARP_SIZE);
+        const unsigned long long other_age = __shfl_xor_sync(MOE_WARP_MASK, age, offset, WARP_SIZE);
+        const uint32_t other_slot = __shfl_xor_sync(MOE_WARP_MASK, slot, offset, WARP_SIZE);
         if (other_frequency < frequency ||
                 (other_frequency == frequency && (other_age < age || (other_age == age && other_slot < slot)))) {
             frequency = other_frequency;
@@ -2787,14 +2797,14 @@ static __device__ uint32_t moe_grouped_warp_min_slot(uint32_t frequency, unsigne
     uint32_t min_frequency = frequency;
 #pragma unroll
     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        min_frequency = min(min_frequency, __shfl_xor_sync(0xffffffff, min_frequency, offset, WARP_SIZE));
+        min_frequency = min(min_frequency, __shfl_xor_sync(MOE_WARP_MASK, min_frequency, offset, WARP_SIZE));
     }
     unsigned long long min_age = frequency == min_frequency ? age : UINT64_MAX;
 #pragma unroll
     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        min_age = min(min_age, __shfl_xor_sync(0xffffffff, min_age, offset, WARP_SIZE));
+        min_age = min(min_age, __shfl_xor_sync(MOE_WARP_MASK, min_age, offset, WARP_SIZE));
     }
-    const uint32_t candidates = __ballot_sync(0xffffffff, frequency == min_frequency && age == min_age);
+    const uint32_t candidates = __ballot_sync(MOE_WARP_MASK, frequency == min_frequency && age == min_age);
     return candidates != 0 ? __ffs(candidates) - 1 : UINT32_MAX;
 }
 
@@ -2995,18 +3005,18 @@ static __global__ void moe_grouped_plan_decode(
             const bool active = lane < n_routes;
             const int32_t expert = active ? warp_route_experts[lane] : -1;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-            const uint32_t first_lane = __ffs(__match_any_sync(0xffffffff, expert)) - 1;
+            const uint32_t first_lane = __ffs(__match_any_sync(MOE_WARP_MASK, expert)) - 1;
 #else
             uint32_t first_lane = lane;
             for (uint32_t source = 0; source < n_routes; ++source) {
-                const int32_t other = __shfl_sync(0xffffffff, expert, source, WARP_SIZE);
+                const int32_t other = __shfl_sync(MOE_WARP_MASK, expert, source, WARP_SIZE);
                 if (active && source < first_lane && other == expert) {
                     first_lane = source;
                 }
             }
 #endif
             const bool first = active && first_lane == lane;
-            const uint32_t first_mask = __ballot_sync(0xffffffff, first);
+            const uint32_t first_mask = __ballot_sync(MOE_WARP_MASK, first);
             const uint32_t unique = __popc(first_mask & moe_grouped_lane_mask_lt(first_lane));
             if (active) {
                 route_unique[lane] = unique;
@@ -3021,9 +3031,9 @@ static __global__ void moe_grouped_plan_decode(
                 unique_experts[unique] = expert;
                 unique_slots[unique] = slot;
             }
-            const uint32_t invalid_mask = __ballot_sync(0xffffffff, invalid_slot);
+            const uint32_t invalid_mask = __ballot_sync(MOE_WARP_MASK, invalid_slot);
             const bool miss = first && slot < 0;
-            const uint32_t miss_mask = __ballot_sync(0xffffffff, miss);
+            const uint32_t miss_mask = __ballot_sync(MOE_WARP_MASK, miss);
             if (miss) {
                 const uint32_t miss_index = __popc(miss_mask & moe_grouped_lane_mask_lt(lane));
                 miss_unique[miss_index] = unique;
@@ -3036,7 +3046,7 @@ static __global__ void moe_grouped_plan_decode(
                 plan->n_unique = __popc(first_mask);
                 plan->n_misses = __popc(miss_mask);
             }
-            __syncwarp(0xffffffff);
+            __syncwarp(MOE_WARP_MASK);
         }
         __syncthreads();
     } else
