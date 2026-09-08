@@ -6514,7 +6514,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 cuda_graph_update_required ? GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE : GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY;
         } else if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR) {
             force_moe_direct();
-            moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
+            // The grouped plan came out as ERROR, so grouped execution is off the
+            // table. DIRECT does not help: begin_graph_dispatch treats every mode
+            // other than LEGACY as grouped_enabled and rejects it via the
+            // certificate on OUTCOME_ERROR, which killed the whole request with a
+            // 500. LEGACY is the established cached path documented for this case
+            // and is also the initial value of moe_dispatch_mode.
+            moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
         } else if (!retain_grouped_capture && graph != nullptr && graph->moe_resource_fingerprint != 0) {
             force_moe_direct();
         }
