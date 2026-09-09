@@ -10,6 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <sstream>
 
 //
@@ -1863,6 +1866,283 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         states.erase(it_best);
     }
+
+    return true;
+}
+
+// on-disk format for the prompt cache
+//
+//   "LSPC" | version | fingerprint | n_states | states...
+//
+// each state is: token blob, checkpoint list, target state, draft state. every blob is
+// length-prefixed so a truncated file is detected instead of being misread.
+namespace {
+
+constexpr char   SERVER_PROMPT_CACHE_MAGIC[4] = { 'L', 'S', 'P', 'C' };
+constexpr uint32_t SERVER_PROMPT_CACHE_FILE_VERSION = 1;
+
+void spc_write_u32(std::ostream & out, uint32_t v) {
+    out.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+
+void spc_write_u64(std::ostream & out, uint64_t v) {
+    out.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+
+void spc_write_i64(std::ostream & out, int64_t v) {
+    out.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+
+void spc_write_i32(std::ostream & out, int32_t v) {
+    out.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+
+template <typename T>
+void spc_write_blob(std::ostream & out, const std::vector<T> & data) {
+    static_assert(sizeof(T) == 1, "blob element must be one byte");
+    spc_write_u64(out, (uint64_t) data.size());
+    if (!data.empty()) {
+        out.write(reinterpret_cast<const char *>(data.data()), data.size());
+    }
+}
+
+bool spc_read_u32(std::istream & in, uint32_t & v) {
+    in.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return (bool) in;
+}
+
+bool spc_read_u64(std::istream & in, uint64_t & v) {
+    in.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return (bool) in;
+}
+
+bool spc_read_i64(std::istream & in, int64_t & v) {
+    in.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return (bool) in;
+}
+
+bool spc_read_i32(std::istream & in, int32_t & v) {
+    in.read(reinterpret_cast<char *>(&v), sizeof(v));
+    return (bool) in;
+}
+
+// refuse absurd lengths rather than trying to allocate them - a corrupt file must not
+// turn into an out-of-memory abort
+constexpr uint64_t SERVER_PROMPT_CACHE_MAX_BLOB = 64ull*1024ull*1024ull*1024ull;
+
+template <typename T>
+bool spc_read_blob(std::istream & in, std::vector<T> & data) {
+    static_assert(sizeof(T) == 1, "blob element must be one byte");
+
+    uint64_t n = 0;
+    if (!spc_read_u64(in, n)) {
+        return false;
+    }
+    if (n > SERVER_PROMPT_CACHE_MAX_BLOB) {
+        return false;
+    }
+
+    data.resize(n);
+    if (n > 0) {
+        in.read(reinterpret_cast<char *>(data.data()), n);
+    }
+
+    return (bool) in;
+}
+
+} // namespace
+
+bool server_prompt_cache::save_file(const std::string & path, const std::string & fingerprint) const {
+    if (path.empty()) {
+        return false;
+    }
+
+    // write to a temporary file and rename, so a crash mid-write cannot leave a half
+    // cache behind that the next start would try to read
+    const std::string path_tmp = path + ".tmp";
+
+    std::ofstream out(path_tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        SRV_WRN("failed to open prompt cache file for writing: %s\n", path_tmp.c_str());
+        return false;
+    }
+
+    out.write(SERVER_PROMPT_CACHE_MAGIC, sizeof(SERVER_PROMPT_CACHE_MAGIC));
+    spc_write_u32(out, SERVER_PROMPT_CACHE_FILE_VERSION);
+
+    spc_write_u64(out, (uint64_t) fingerprint.size());
+    out.write(fingerprint.data(), fingerprint.size());
+
+    spc_write_u32(out, (uint32_t) states.size());
+
+    for (const auto & state : states) {
+        const std::vector<char> tokens_packed = state.prompt.tokens.serialize();
+        spc_write_blob(out, tokens_packed);
+
+        spc_write_u32(out, (uint32_t) state.prompt.checkpoints.size());
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            spc_write_i64(out, ckpt.n_tokens);
+            spc_write_i32(out, (int32_t) ckpt.pos_min);
+            spc_write_i32(out, (int32_t) ckpt.pos_max);
+            spc_write_blob(out, ckpt.data_tgt);
+            spc_write_blob(out, ckpt.data_dft);
+            spc_write_blob(out, ckpt.data_spec);
+        }
+
+        spc_write_blob(out, state.data.main);
+        spc_write_blob(out, state.data.drft);
+    }
+
+    out.flush();
+    if (!out) {
+        SRV_WRN("failed to write prompt cache file: %s\n", path_tmp.c_str());
+        out.close();
+        std::remove(path_tmp.c_str());
+        return false;
+    }
+    out.close();
+
+    std::remove(path.c_str());
+    if (std::rename(path_tmp.c_str(), path.c_str()) != 0) {
+        SRV_WRN("failed to move prompt cache into place: %s\n", path.c_str());
+        std::remove(path_tmp.c_str());
+        return false;
+    }
+
+    SRV_INF("saved prompt cache to %s (%zu states, %zu tokens, %.3f MiB)\n",
+            path.c_str(), states.size(), n_tokens(), (float) size() / 1024 / 1024);
+
+    return true;
+}
+
+bool server_prompt_cache::load_file(const std::string & path, const std::string & fingerprint) {
+    if (path.empty()) {
+        return false;
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        // no cache yet - the ordinary case on a first run
+        return false;
+    }
+
+    char magic[sizeof(SERVER_PROMPT_CACHE_MAGIC)] = {};
+    in.read(magic, sizeof(magic));
+    if (!in || std::memcmp(magic, SERVER_PROMPT_CACHE_MAGIC, sizeof(magic)) != 0) {
+        SRV_WRN("prompt cache file %s is not a prompt cache - ignoring\n", path.c_str());
+        return false;
+    }
+
+    uint32_t version = 0;
+    if (!spc_read_u32(in, version) || version != SERVER_PROMPT_CACHE_FILE_VERSION) {
+        SRV_WRN("prompt cache file %s has version %u, expected %u - ignoring\n",
+                path.c_str(), version, SERVER_PROMPT_CACHE_FILE_VERSION);
+        return false;
+    }
+
+    uint64_t fingerprint_size = 0;
+    if (!spc_read_u64(in, fingerprint_size) || fingerprint_size > SERVER_PROMPT_CACHE_MAX_BLOB) {
+        return false;
+    }
+
+    std::string fingerprint_file(fingerprint_size, '\0');
+    if (fingerprint_size > 0) {
+        in.read(fingerprint_file.data(), fingerprint_size);
+    }
+    if (!in) {
+        return false;
+    }
+
+    if (fingerprint_file != fingerprint) {
+        // the state describes a different model, context size or KV type. reusing it would
+        // not be merely stale - the KV geometry would not match at all
+        SRV_WRN("prompt cache %s was written by a different configuration - ignoring\n", path.c_str());
+        SRV_WRN("  file:    %s\n", fingerprint_file.c_str());
+        SRV_WRN("  current: %s\n", fingerprint.c_str());
+        return false;
+    }
+
+    uint32_t n_states = 0;
+    if (!spc_read_u32(in, n_states)) {
+        return false;
+    }
+
+    std::list<server_prompt_cache_state> loaded;
+
+    for (uint32_t i = 0; i < n_states; ++i) {
+        std::vector<char> tokens_packed;
+        if (!spc_read_blob(in, tokens_packed)) {
+            SRV_WRN("prompt cache %s is truncated - keeping the %zu states read so far\n",
+                    path.c_str(), loaded.size());
+            break;
+        }
+        if (tokens_packed.size() % sizeof(llama_token) != 0) {
+            SRV_WRN("prompt cache %s has a malformed token blob - stopping here\n", path.c_str());
+            break;
+        }
+
+        auto & state = loaded.emplace_back();
+
+        {
+            const llama_token * ptr = reinterpret_cast<const llama_token *>(tokens_packed.data());
+            const llama_tokens packed(ptr, ptr + tokens_packed.size() / sizeof(llama_token));
+
+            try {
+                // media chunks are not persisted, so a multimodal prompt cannot be restored
+                state.prompt.tokens = server_tokens::deserialize(packed, false);
+            } catch (const std::exception & err) {
+                SRV_WRN("prompt cache %s holds an unreadable prompt (%s) - stopping here\n",
+                        path.c_str(), err.what());
+                loaded.pop_back();
+                break;
+            }
+        }
+
+        uint32_t n_ckpt = 0;
+        if (!spc_read_u32(in, n_ckpt)) {
+            loaded.pop_back();
+            break;
+        }
+
+        bool ok = true;
+        for (uint32_t j = 0; j < n_ckpt && ok; ++j) {
+            auto & ckpt = state.prompt.checkpoints.emplace_back();
+
+            int64_t n_tokens_ckpt = 0;
+            int32_t pos_min = 0;
+            int32_t pos_max = 0;
+
+            ok = spc_read_i64(in, n_tokens_ckpt) &&
+                 spc_read_i32(in, pos_min)       &&
+                 spc_read_i32(in, pos_max)       &&
+                 spc_read_blob(in, ckpt.data_tgt) &&
+                 spc_read_blob(in, ckpt.data_dft) &&
+                 spc_read_blob(in, ckpt.data_spec);
+
+            if (ok) {
+                ckpt.update_pos(n_tokens_ckpt, pos_min, pos_max);
+            }
+        }
+
+        if (!ok || !spc_read_blob(in, state.data.main) || !spc_read_blob(in, state.data.drft)) {
+            SRV_WRN("prompt cache %s is truncated - keeping the %zu complete states\n",
+                    path.c_str(), loaded.size() - 1);
+            loaded.pop_back();
+            break;
+        }
+    }
+
+    if (loaded.empty()) {
+        return false;
+    }
+
+    states = std::move(loaded);
+
+    // honour the in-memory limits, which may be smaller than when the file was written
+    update();
+
+    SRV_INF("loaded prompt cache from %s (%zu states, %zu tokens, %.3f MiB)\n",
+            path.c_str(), states.size(), n_tokens(), (float) size() / 1024 / 1024);
 
     return true;
 }

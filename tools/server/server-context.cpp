@@ -873,7 +873,37 @@ public:
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
+    // identity of the configuration that produced a prompt cache. a saved state is only
+    // meaningful for the same model, context size and KV types: reusing it across those is
+    // not stale data but mismatched KV geometry, so load_file() compares this and refuses
+    // anything that differs. the draft model is included because data.drft depends on it.
+    std::string prompt_cache_fingerprint() const {
+        return std::string("model=") + params_base.model.path +
+               " n_ctx=" + std::to_string(n_ctx) +
+               " ctk="   + ggml_type_name(params_base.cache_type_k) +
+               " ctv="   + ggml_type_name(params_base.cache_type_v) +
+               " draft=" + params_base.speculative.draft.mparams.path;
+    }
+
     ~server_context_impl() {
+        if (prompt_cache && !params_base.cache_file.empty()) {
+            // a prompt only reaches the cache once a new task displaces it from its slot, so
+            // a server shut down between requests would otherwise persist nothing at all.
+            // flush the idle slots first - this reads the sequence state, so it has to happen
+            // while the contexts are still alive, i.e. before destroy()
+            if (!sleeping) {
+                for (auto & slot : slots) {
+                    if (slot.state == SLOT_STATE_IDLE) {
+                        slot.prompt_save(*prompt_cache);
+                    }
+                }
+
+                prompt_cache->update();
+            }
+
+            prompt_cache->save_file(params_base.cache_file, prompt_cache_fingerprint());
+        }
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1431,8 +1461,16 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (!params_base.cache_file.empty()) {
+                prompt_cache->load_file(params_base.cache_file, prompt_cache_fingerprint());
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+
+            if (!params_base.cache_file.empty()) {
+                SRV_WRN("%s", "--cache-file has no effect without --cache-ram\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 

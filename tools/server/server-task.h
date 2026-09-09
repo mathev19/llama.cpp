@@ -629,6 +629,13 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // persist the whole cache to disk so it survives a server restart. the file carries a
+    // fingerprint of the configuration that produced it (model, context size, KV types,
+    // draft model) and load_file() refuses anything that does not match - a state written
+    // by a different model is not merely stale, it is meaningless.
+    bool save_file(const std::string & path, const std::string & fingerprint) const;
+    bool load_file(const std::string & path, const std::string & fingerprint);
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
