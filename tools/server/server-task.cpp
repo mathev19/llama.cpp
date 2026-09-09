@@ -2015,7 +2015,7 @@ bool server_prompt_cache::save_file(const std::string & path, const std::string 
     return true;
 }
 
-bool server_prompt_cache::load_file(const std::string & path, const std::string & fingerprint) {
+bool server_prompt_cache::load_file(const std::string & path, const std::string & fingerprint, bool has_mtmd) {
     if (path.empty()) {
         return false;
     }
@@ -2088,8 +2088,9 @@ bool server_prompt_cache::load_file(const std::string & path, const std::string 
             const llama_tokens packed(ptr, ptr + tokens_packed.size() / sizeof(llama_token));
 
             try {
-                // media chunks are not persisted, so a multimodal prompt cannot be restored
-                state.prompt.tokens = server_tokens::deserialize(packed, false);
+                // has_mtmd has to match the server: load() moves a cached prompt straight into
+                // the slot, and appending an image chunk to it later asserts on this flag
+                state.prompt.tokens = server_tokens::deserialize(packed, has_mtmd);
             } catch (const std::exception & err) {
                 SRV_WRN("prompt cache %s holds an unreadable prompt (%s) - stopping here\n",
                         path.c_str(), err.what());

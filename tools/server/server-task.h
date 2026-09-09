@@ -634,7 +634,7 @@ struct server_prompt_cache {
     // draft model) and load_file() refuses anything that does not match - a state written
     // by a different model is not merely stale, it is meaningless.
     bool save_file(const std::string & path, const std::string & fingerprint) const;
-    bool load_file(const std::string & path, const std::string & fingerprint);
+    bool load_file(const std::string & path, const std::string & fingerprint, bool has_mtmd);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

@@ -1463,7 +1463,7 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
 
             if (!params_base.cache_file.empty()) {
-                prompt_cache->load_file(params_base.cache_file, prompt_cache_fingerprint());
+                prompt_cache->load_file(params_base.cache_file, prompt_cache_fingerprint(), mctx != nullptr);
             }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
