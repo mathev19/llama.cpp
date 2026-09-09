@@ -2696,6 +2696,39 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // A hybrid or recurrent model cannot resume from a plain KV prefix: its
+                        // state is a snapshot at a single position, not a range that can be
+                        // partially reused. The request path looks for a context checkpoint and,
+                        // finding none, logs "forcing full prompt re-processing due to lack of
+                        // cache data" and reprocesses the entire prompt - which defeats the whole
+                        // point of restoring the slot.
+                        //
+                        // The state we just loaded is exactly such a snapshot, so publish it as a
+                        // checkpoint. pos_min is 0 because the restored state covers the prompt
+                        // from its start; that also satisfies the "cur.pos_min == 0" acceptance
+                        // test in the checkpoint search.
+                        //
+                        // create_checkpoint() is not reusable here: it dereferences slot->task,
+                        // which is null while the slot sits idle waiting for a restore.
+                        {
+                            auto & ckpt = slot->prompt.checkpoints.emplace_back();
+
+                            const llama_pos pos_max =
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+
+                            ckpt.update_pos(slot->prompt.n_tokens(), 0, pos_max);
+                            ckpt.update_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.update_dft(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                            if (spec) {
+                                common_speculative_get_state(spec.get(), slot->id, ckpt.data_spec);
+                            }
+
+                            SRV_INF("restored slot %d as context checkpoint (n_tokens = %d, pos_max = %d, size = %.3f MiB)\n",
+                                    slot->id, slot->prompt.n_tokens(), pos_max,
+                                    (float) ckpt.size() / 1024 / 1024);
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
